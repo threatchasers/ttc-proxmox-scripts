@@ -1,0 +1,762 @@
+#!/usr/bin/env bash
+# ============================================================
+# TTC Script Standard
+# Name: pve-backup
+# Version: 1.8.0
+# Purpose:
+#   Disaster-recovery backup of Proxmox node configuration.
+#
+# Retention:
+#   - Local keep: 1
+#   - VAULT storages keep: 1
+#   - BACKUPS storages keep: 3
+#   - TTC storages keep: 1
+#
+# Remote path rules:
+#   - VAULT:   <storage-path>/<last3octets>/PVE-Backup/<timestamp>
+#   - BACKUPS: <storage-path>/<last3octets>/PVE-Backup/<timestamp>
+#   - TTC:     <storage-path>/Nodes/<last3octets>/PVE-Backup/<timestamp>
+#
+# Local path rule:
+#   - /opt/Config/Fetch/Backups/Nodes/<last3octets>/PVE-Backup/<timestamp>
+#
+# Features:
+#   - Safe working directory
+#   - Storage discovery from /etc/pve/storage.cfg
+#   - Timeout-bounded remote operations
+#   - Tolerant NFS server pre-check for cloud-backed storage
+#   - Final execution summary
+#   - --restore-plan to locate the newest viable backup source
+# ============================================================
+
+set -Eeuo pipefail
+
+SCRIPT_NAME="pve-backup"
+SCRIPT_VERSION="1.8.0"
+
+SCRIPT_DIR="/opt/Config/Sync/Scripts"
+LOG_DIR="/opt/Config/Fetch/Logs"
+LOCAL_ROOT="/opt/Config/Fetch/Backups/Nodes"
+STATE_BACKUP_DIR="/root/opt/Config/Fetch/Backup"
+
+ENV_FILE="${SCRIPT_DIR}/pve-backup.env"
+WRAPPER="/usr/local/bin/pve-backup"
+SERVICE_FILE="/etc/systemd/system/pve-backup.service"
+TIMER_FILE="/etc/systemd/system/pve-backup.timer"
+
+TIMESTAMP="$(date '+%Y%m%d-%H%M%S')"
+LOG_FILE="${LOG_DIR}/${TIMESTAMP}-${SCRIPT_NAME}.log"
+
+mkdir -p "$SCRIPT_DIR" "$LOG_DIR" "$LOCAL_ROOT" "$STATE_BACKUP_DIR"
+
+cd / 2>/dev/null || cd /root 2>/dev/null || true
+
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+RUN_SUMMARY=()
+
+log() {
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+rotate_logs() {
+    find "$LOG_DIR" -maxdepth 1 -type f -name "*-${SCRIPT_NAME}.log" | sort -r | awk 'NR>3' | while read -r oldlog; do
+        rm -f "$oldlog"
+    done
+}
+
+load_env() {
+    LOCAL_KEEP="1"
+    VAULT_KEEP="1"
+    BACKUPS_KEEP="3"
+    TTC_KEEP="1"
+
+    REMOTE_LABEL="PVE-Backup"
+    REMOTE_SHORT_MODE="last3octets"
+    TIMER_ON_CALENDAR="*-*-* 01:00:00"
+
+    ENABLE_VAULT="1"
+    ENABLE_BACKUPS="1"
+    ENABLE_TTC="1"
+
+    NETWORK_CHECK_TIMEOUT="15"
+    RSYNC_TIMEOUT="180"
+    STORAGE_OP_TIMEOUT="180"
+
+    if [[ -f "$ENV_FILE" ]]; then
+        log "📥 Loading ENV from $ENV_FILE"
+        # shellcheck disable=SC1090
+        source "$ENV_FILE"
+    else
+        log "ℹ️ ENV file not found, using defaults"
+    fi
+}
+
+get_primary_ip() {
+    ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="src"){print $(i+1); exit}}}'
+}
+
+build_short_ip() {
+    local ip="$1"
+    local a b c d
+    IFS='.' read -r a b c d <<< "$ip"
+    echo "${b}.${c}.${d}"
+}
+
+elapsed_seconds() {
+    local start_ts="$1"
+    local end_ts="$2"
+    echo $(( end_ts - start_ts ))
+}
+
+sync_item() {
+    local src="$1"
+    local dst_parent="$2"
+    local start_ts end_ts secs
+
+    if [[ ! -e "$src" ]]; then
+        log "ℹ️ Source missing, skipped: $src"
+        return 0
+    fi
+
+    mkdir -p "$dst_parent"
+    log "➡️  Sync: $src  ==>  $dst_parent"
+
+    start_ts="$(date +%s)"
+    if rsync -a --delete --timeout="$RSYNC_TIMEOUT" "$src" "$dst_parent/" >/dev/null 2>&1; then
+        end_ts="$(date +%s)"
+        secs="$(elapsed_seconds "$start_ts" "$end_ts")"
+        log "✅ Local sync completed: $src (${secs}s)"
+        return 0
+    else
+        end_ts="$(date +%s)"
+        secs="$(elapsed_seconds "$start_ts" "$end_ts")"
+        log "❌ Local sync failed: $src -> $dst_parent (${secs}s)"
+        return 1
+    fi
+}
+
+prune_snapshots() {
+    local base_dir="$1"
+    local keep="$2"
+
+    [[ -d "$base_dir" ]] || return 0
+
+    find "$base_dir" -mindepth 1 -maxdepth 1 -type d \
+        -regextype posix-extended \
+        -regex '.*/[0-9]{8}-[0-9]{6}$' \
+        | sort -r \
+        | awk -v keep="$keep" 'NR>keep' \
+        | while read -r olddir; do
+            log "🧹 Pruning old snapshot: $olddir"
+            rm -rf "$olddir"
+        done
+}
+
+write_meta() {
+    local meta_dir="$1"
+    local node_ip="$2"
+    local short_ip="$3"
+
+    mkdir -p "$meta_dir"
+
+    cat > "${meta_dir}/backup-info.txt" <<EOF
+ScriptName=${SCRIPT_NAME}
+ScriptVersion=${SCRIPT_VERSION}
+Timestamp=${TIMESTAMP}
+NodeIP=${node_ip}
+ShortIP=${short_ip}
+Hostname=$(hostname -f 2>/dev/null || hostname)
+Kernel=$(uname -r)
+EOF
+
+    cp -f /etc/pve/storage.cfg "${meta_dir}/storage.cfg" 2>/dev/null || true
+    cp -f /etc/pve/datacenter.cfg "${meta_dir}/datacenter.cfg" 2>/dev/null || true
+
+    pvesm status > "${meta_dir}/pvesm-status.txt" 2>/dev/null || true
+    qm list > "${meta_dir}/qm-list.txt" 2>/dev/null || true
+    pct list > "${meta_dir}/pct-list.txt" 2>/dev/null || true
+
+    ip addr show > "${meta_dir}/ip-addr.txt" 2>/dev/null || true
+    ip route show > "${meta_dir}/ip-route.txt" 2>/dev/null || true
+    lsblk > "${meta_dir}/lsblk.txt" 2>/dev/null || true
+    blkid > "${meta_dir}/blkid.txt" 2>/dev/null || true
+    mount > "${meta_dir}/mount.txt" 2>/dev/null || true
+    df -h > "${meta_dir}/df-h.txt" 2>/dev/null || true
+}
+
+discover_storages() {
+    local current_type=""
+    local current_id=""
+    local current_path=""
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^([a-zA-Z0-9_-]+):[[:space:]]+(.+)$ ]]; then
+            if [[ -n "$current_id" && -n "$current_path" ]]; then
+                echo "${current_id}|${current_type}|${current_path}"
+            fi
+            current_type="${BASH_REMATCH[1]}"
+            current_id="${BASH_REMATCH[2]}"
+            current_path=""
+            continue
+        fi
+
+        if [[ "$line" =~ ^[[:space:]]*path[[:space:]]+(.+)$ ]]; then
+            current_path="${BASH_REMATCH[1]}"
+            continue
+        fi
+    done < /etc/pve/storage.cfg
+
+    if [[ -n "$current_id" && -n "$current_path" ]]; then
+        echo "${current_id}|${current_type}|${current_path}"
+    fi
+}
+
+get_nfs_server() {
+    local storage_id="$1"
+    awk -v id="$storage_id" '
+    $0 ~ "^nfs: " id "$" { in_block=1; next }
+    in_block && $1=="server" { print $2; exit }
+    /^[^[:space:]]/ && in_block { in_block=0 }
+    ' /etc/pve/storage.cfg
+}
+
+check_storage_ready() {
+    local sid="$1"
+    local stype="$2"
+    local spath="$3"
+
+    # No network pre-check for local dir storage.
+    if [[ "$stype" == "nfs" ]]; then
+        local server=""
+        server="$(get_nfs_server "$sid" || true)"
+
+        if [[ -n "$server" ]]; then
+            if ! timeout "$NETWORK_CHECK_TIMEOUT" ping -c 1 -W 2 "$server" >/dev/null 2>&1; then
+                log "❌ NFS server slow or unreachable within ${NETWORK_CHECK_TIMEOUT}s: $sid -> $server"
+                return 1
+            else
+                log "ℹ️ NFS server reachable: $sid -> $server"
+            fi
+        else
+            log "ℹ️ NFS server not parsed for storage: $sid"
+        fi
+    fi
+
+    if ! timeout "$STORAGE_OP_TIMEOUT" test -d "$spath" >/dev/null 2>&1; then
+        log "❌ Storage not reachable within ${STORAGE_OP_TIMEOUT}s or path missing: $sid ($stype) -> $spath"
+        return 1
+    fi
+
+    if ! timeout "$STORAGE_OP_TIMEOUT" stat "$spath" >/dev/null 2>&1; then
+        log "❌ Storage not reachable within ${STORAGE_OP_TIMEOUT}s (stat timeout): $sid ($stype) -> $spath"
+        return 1
+    fi
+
+    case "$stype" in
+        nfs|cifs)
+            if ! timeout "$STORAGE_OP_TIMEOUT" mountpoint -q "$spath" >/dev/null 2>&1; then
+                log "❌ Storage not reachable within ${STORAGE_OP_TIMEOUT}s or not mounted: $sid ($stype) -> $spath"
+                return 1
+            fi
+            ;;
+        dir)
+            log "ℹ️ Local dir storage detected and reachable: $sid ($stype) -> $spath"
+            ;;
+        *)
+            log "ℹ️ Storage type reachable but not explicitly mount-checked: $sid ($stype) -> $spath"
+            ;;
+    esac
+
+    return 0
+}
+
+run_remote_sync() {
+    local sid="$1"
+    local stype="$2"
+    local spath="$3"
+    local remote_root="$4"
+    local remote_snapshot="$5"
+    local keep="$6"
+    local class_label="$7"
+    local snapshot_dir="$8"
+    local start_ts end_ts secs
+
+    log "🧭 ${class_label} match: ${sid} (${stype}) -> ${spath}"
+
+    if ! check_storage_ready "$sid" "$stype" "$spath"; then
+        log "⚠️ ${class_label} storage was slow or unreachable, skipping: $sid ($stype) -> $spath"
+        RUN_SUMMARY+=("${class_label}|${sid}|SKIPPED|slow-or-unreachable")
+        return 0
+    fi
+
+    if ! timeout "$STORAGE_OP_TIMEOUT" mkdir -p "$remote_snapshot" >/dev/null 2>&1; then
+        log "❌ ${class_label} storage was not reachable during directory creation within ${STORAGE_OP_TIMEOUT}s: $sid -> $remote_snapshot"
+        log "⚠️ ${class_label} destination skipped: $sid"
+        RUN_SUMMARY+=("${class_label}|${sid}|SKIPPED|mkdir-failed")
+        return 0
+    fi
+
+    start_ts="$(date +%s)"
+    if timeout "$STORAGE_OP_TIMEOUT" rsync -a --delete --timeout="$RSYNC_TIMEOUT" "${snapshot_dir}/" "${remote_snapshot}/" >/dev/null 2>&1; then
+        end_ts="$(date +%s)"
+        secs="$(elapsed_seconds "$start_ts" "$end_ts")"
+        log "✅ ${class_label} sync completed: $remote_snapshot (${secs}s)"
+        prune_snapshots "$remote_root" "$keep"
+        RUN_SUMMARY+=("${class_label}|${sid}|OK|${secs}s")
+    else
+        end_ts="$(date +%s)"
+        secs="$(elapsed_seconds "$start_ts" "$end_ts")"
+        log "❌ ${class_label} storage was not reachable or rsync timed out/failed within ${STORAGE_OP_TIMEOUT}s: $sid -> $remote_snapshot (${secs}s)"
+        log "⚠️ ${class_label} destination skipped after failed sync: $sid"
+        RUN_SUMMARY+=("${class_label}|${sid}|FAILED|${secs}s")
+    fi
+
+    return 0
+}
+
+find_latest_snapshot_in_root() {
+    local root="$1"
+    [[ -d "$root" ]] || return 1
+
+    find "$root" -mindepth 1 -maxdepth 1 -type d \
+        -regextype posix-extended \
+        -regex '.*/[0-9]{8}-[0-9]{6}$' \
+        | sort -r \
+        | head -n 1
+}
+
+restore_plan() {
+    load_env
+
+    local node_ip short_ip
+    local best_path="" best_source="" best_stamp=""
+    node_ip="$(get_primary_ip)"
+    short_ip="$(build_short_ip "$node_ip")"
+
+    log "🧭 Building restore plan for node IP ${node_ip} / short ID ${short_ip}"
+
+    # Local candidate
+    local local_root local_latest local_stamp
+    local_root="${LOCAL_ROOT}/${short_ip}/${REMOTE_LABEL}"
+    local_latest="$(find_latest_snapshot_in_root "$local_root" || true)"
+    if [[ -n "$local_latest" ]]; then
+        local_stamp="$(basename "$local_latest")"
+        best_path="$local_latest"
+        best_source="LOCAL"
+        best_stamp="$local_stamp"
+    fi
+
+    # Remote candidates
+    mapfile -t storages < <(discover_storages)
+
+    for item in "${storages[@]}"; do
+        IFS='|' read -r sid stype spath <<< "$item"
+
+        local candidate_root="" candidate_latest="" candidate_stamp=""
+
+        if [[ "$ENABLE_BACKUPS" == "1" && "$sid" == *"BACKUPS"* ]]; then
+            candidate_root="${spath}/${short_ip}/${REMOTE_LABEL}"
+        elif [[ "$ENABLE_VAULT" == "1" && "$sid" == *"VAULT"* ]]; then
+            candidate_root="${spath}/${short_ip}/${REMOTE_LABEL}"
+        elif [[ "$ENABLE_TTC" == "1" && "$sid" == *"TTC"* ]]; then
+            candidate_root="${spath}/Nodes/${short_ip}/${REMOTE_LABEL}"
+        else
+            continue
+        fi
+
+        candidate_latest="$(find_latest_snapshot_in_root "$candidate_root" || true)"
+        if [[ -n "$candidate_latest" ]]; then
+            candidate_stamp="$(basename "$candidate_latest")"
+            if [[ -z "$best_stamp" || "$candidate_stamp" > "$best_stamp" ]]; then
+                best_path="$candidate_latest"
+                best_source="$sid"
+                best_stamp="$candidate_stamp"
+            fi
+        fi
+    done
+
+    echo
+    echo "====== ${SCRIPT_NAME} restore plan v${SCRIPT_VERSION} ======"
+    echo "Node IP:    $node_ip"
+    echo "Short ID:   $short_ip"
+    echo
+
+    if [[ -z "$best_path" ]]; then
+        echo "No se encontró ningún snapshot válido."
+        echo
+        echo "Rutas revisadas:"
+        echo "  - Local: ${local_root}"
+        for item in "${storages[@]}"; do
+            IFS='|' read -r sid stype spath <<< "$item"
+            if [[ "$sid" == *"BACKUPS"* || "$sid" == *"VAULT"* ]]; then
+                echo "  - ${sid}: ${spath}/${short_ip}/${REMOTE_LABEL}"
+            elif [[ "$sid" == *"TTC"* ]]; then
+                echo "  - ${sid}: ${spath}/Nodes/${short_ip}/${REMOTE_LABEL}"
+            fi
+        done
+        return 1
+    fi
+
+    echo "Newest backup source: $best_source"
+    echo "Newest backup path:   $best_path"
+    echo "Snapshot timestamp:   $best_stamp"
+    echo
+
+    cat <<EOF
+Restore plan propuesto:
+
+1. Reinstalar Proxmox VE en el nodo objetivo.
+2. Restaurar conectividad básica de red para poder acceder al host.
+3. Montar o reconectar el storage origen del backup.
+4. Verificar el snapshot seleccionado:
+   $best_path
+5. Restaurar primero estos elementos críticos:
+   - etc/hostname
+   - etc/hosts
+   - etc/resolv.conf
+   - etc/network/
+   - etc/fstab
+   - etc/ssh/
+6. Restaurar luego la configuración Proxmox:
+   - etc/pve/
+   - etc/apt/
+   - etc/systemd/system/
+   - opt/Config/Sync/Scripts/
+   - usr/local/bin/
+7. Revisar _meta/ para validar:
+   - storage.cfg
+   - datacenter.cfg
+   - qm-list.txt
+   - pct-list.txt
+   - pvesm-status.txt
+   - lsblk.txt
+   - blkid.txt
+   - mount.txt
+8. Reiniciar servicios necesarios o el nodo completo.
+9. Verificar cluster, storages, red, VMs y CTs.
+10. Solo después de validar consistencia, reactivar tareas automáticas.
+
+Comandos orientativos para inspección:
+
+  ls -lah "$best_path"
+  find "$best_path" -maxdepth 3 | less
+
+Ejemplos de restauración manual selectiva:
+
+  rsync -a "$best_path/etc/network/" /etc/network/
+  rsync -a "$best_path/etc/pve/" /etc/pve/
+  rsync -a "$best_path/opt/Config/Sync/Scripts/" /opt/Config/Sync/Scripts/
+
+Nota:
+- Este comando NO restaura automáticamente.
+- Selecciona el backup más reciente encontrado entre local y remotos.
+- La restauración debe hacerse de forma controlada.
+EOF
+}
+
+print_summary() {
+    echo
+    echo "====== ${SCRIPT_NAME} summary v${SCRIPT_VERSION} ======"
+    echo "Local snapshot: OK"
+    if [[ "${#RUN_SUMMARY[@]}" -eq 0 ]]; then
+        echo "Remote destinations: none"
+        return 0
+    fi
+
+    local entry class sid status detail
+    for entry in "${RUN_SUMMARY[@]}"; do
+        IFS='|' read -r class sid status detail <<< "$entry"
+        echo "${class}: ${sid} -> ${status} (${detail})"
+    done
+}
+
+status_script() {
+    load_env
+
+    local node_ip short_ip local_host_root
+    node_ip="$(get_primary_ip)"
+    short_ip="$(build_short_ip "$node_ip")"
+    local_host_root="${LOCAL_ROOT}/${short_ip}/${REMOTE_LABEL}"
+
+    echo "====== ${SCRIPT_NAME} v${SCRIPT_VERSION} ======"
+    echo "Node IP:            $node_ip"
+    echo "Short ID:           $short_ip"
+    echo "Log file:           $LOG_FILE"
+    echo "Local keep:         $LOCAL_KEEP"
+    echo "VAULT keep:         $VAULT_KEEP"
+    echo "BACKUPS keep:       $BACKUPS_KEEP"
+    echo "TTC keep:           $TTC_KEEP"
+    echo "Remote label:       $REMOTE_LABEL"
+    echo "Short mode:         $REMOTE_SHORT_MODE"
+    echo "Enable VAULT:       $ENABLE_VAULT"
+    echo "Enable BACKUPS:     $ENABLE_BACKUPS"
+    echo "Enable TTC:         $ENABLE_TTC"
+    echo "Network timeout:    $NETWORK_CHECK_TIMEOUT"
+    echo "Rsync timeout:      $RSYNC_TIMEOUT"
+    echo "Storage op timeout: $STORAGE_OP_TIMEOUT"
+    echo
+    echo "Local destination root:"
+    echo "  - ${local_host_root}/${TIMESTAMP}"
+    echo
+
+    mapfile -t storages < <(discover_storages)
+
+    echo "Storages encontrados en storage.cfg:"
+    if [[ "${#storages[@]}" -eq 0 ]]; then
+        echo "  (none)"
+        return 0
+    fi
+
+    for item in "${storages[@]}"; do
+        IFS='|' read -r sid stype spath <<< "$item"
+        echo "  - $sid ($stype) -> $spath"
+    done
+
+    echo
+    echo "Destinos remotos efectivos:"
+    for item in "${storages[@]}"; do
+        IFS='|' read -r sid stype spath <<< "$item"
+
+        if [[ "$ENABLE_BACKUPS" == "1" && "$sid" == *"BACKUPS"* ]]; then
+            echo "  - BACKUPS: ${spath}/${short_ip}/${REMOTE_LABEL}/${TIMESTAMP}"
+        fi
+
+        if [[ "$ENABLE_VAULT" == "1" && "$sid" == *"VAULT"* ]]; then
+            echo "  - VAULT:   ${spath}/${short_ip}/${REMOTE_LABEL}/${TIMESTAMP}"
+        fi
+
+        if [[ "$ENABLE_TTC" == "1" && "$sid" == *"TTC"* ]]; then
+            echo "  - TTC:     ${spath}/Nodes/${short_ip}/${REMOTE_LABEL}/${TIMESTAMP}"
+        fi
+    done
+}
+
+run_backup() {
+    rotate_logs
+    load_env
+    RUN_SUMMARY=()
+
+    local node_ip short_ip host_dir snapshot_dir meta_dir
+    node_ip="$(get_primary_ip)"
+    short_ip="$(build_short_ip "$node_ip")"
+
+    if [[ -z "$node_ip" ]]; then
+        log "❌ Unable to determine primary IP"
+        exit 1
+    fi
+
+    host_dir="${LOCAL_ROOT}/${short_ip}/${REMOTE_LABEL}"
+    snapshot_dir="${host_dir}/${TIMESTAMP}"
+    meta_dir="/tmp/${SCRIPT_NAME}_meta_${TIMESTAMP}"
+
+    log "🧾 Script: ${SCRIPT_NAME} v${SCRIPT_VERSION}"
+    log "🌐 Node IP: ${node_ip}"
+    log "🕵️ Short ID: ${short_ip}"
+    log "📦 Local snapshot: ${snapshot_dir}"
+
+    mkdir -p "$snapshot_dir"
+    write_meta "$meta_dir" "$node_ip" "$short_ip"
+
+    sync_item "/etc/pve" "$snapshot_dir/etc"
+    sync_item "/etc/apt" "$snapshot_dir/etc"
+    sync_item "/etc/network" "$snapshot_dir/etc"
+    sync_item "/etc/systemd/system" "$snapshot_dir/etc/systemd"
+    sync_item "/etc/hosts" "$snapshot_dir/etc"
+    sync_item "/etc/hostname" "$snapshot_dir/etc"
+    sync_item "/etc/resolv.conf" "$snapshot_dir/etc"
+    sync_item "/etc/fstab" "$snapshot_dir/etc"
+    sync_item "/etc/modules" "$snapshot_dir/etc"
+    sync_item "/etc/modules-load.d" "$snapshot_dir/etc"
+    sync_item "/etc/modprobe.d" "$snapshot_dir/etc"
+    sync_item "/etc/default" "$snapshot_dir/etc"
+    sync_item "/etc/ssh" "$snapshot_dir/etc"
+    sync_item "/etc/passwd" "$snapshot_dir/etc"
+    sync_item "/etc/group" "$snapshot_dir/etc"
+    sync_item "/etc/shadow" "$snapshot_dir/etc"
+    sync_item "/etc/subuid" "$snapshot_dir/etc"
+    sync_item "/etc/subgid" "$snapshot_dir/etc"
+    sync_item "/etc/cron.d" "$snapshot_dir/etc"
+    sync_item "/etc/cron.daily" "$snapshot_dir/etc"
+    sync_item "/etc/cron.hourly" "$snapshot_dir/etc"
+    sync_item "/etc/cron.weekly" "$snapshot_dir/etc"
+    sync_item "/etc/cron.monthly" "$snapshot_dir/etc"
+    sync_item "/var/spool/cron" "$snapshot_dir/var/spool"
+    sync_item "/usr/local/bin" "$snapshot_dir/usr/local"
+    sync_item "/opt/Config/Sync/Scripts" "$snapshot_dir/opt/Config/Sync"
+    sync_item "/root" "$snapshot_dir"
+    sync_item "$meta_dir" "$snapshot_dir/_meta"
+
+    prune_snapshots "$host_dir" "$LOCAL_KEEP"
+
+    mapfile -t storages < <(discover_storages)
+
+    if [[ "${#storages[@]}" -eq 0 ]]; then
+        log "ℹ️ No storages found in /etc/pve/storage.cfg"
+        log "✅ Local backup completed only."
+        rm -rf "$meta_dir" 2>/dev/null || true
+        print_summary
+        return 0
+    fi
+
+    for item in "${storages[@]}"; do
+        IFS='|' read -r sid stype spath <<< "$item"
+
+        if [[ "$ENABLE_BACKUPS" == "1" && "$sid" == *"BACKUPS"* ]]; then
+            local remote_root_backups remote_snapshot_backups
+            remote_root_backups="${spath}/${short_ip}/${REMOTE_LABEL}"
+            remote_snapshot_backups="${remote_root_backups}/${TIMESTAMP}"
+
+            run_remote_sync \
+                "$sid" "$stype" "$spath" \
+                "$remote_root_backups" "$remote_snapshot_backups" "$BACKUPS_KEEP" \
+                "BACKUPS" "$snapshot_dir"
+        fi
+
+        if [[ "$ENABLE_VAULT" == "1" && "$sid" == *"VAULT"* ]]; then
+            local remote_root_vault remote_snapshot_vault
+            remote_root_vault="${spath}/${short_ip}/${REMOTE_LABEL}"
+            remote_snapshot_vault="${remote_root_vault}/${TIMESTAMP}"
+
+            run_remote_sync \
+                "$sid" "$stype" "$spath" \
+                "$remote_root_vault" "$remote_snapshot_vault" "$VAULT_KEEP" \
+                "VAULT" "$snapshot_dir"
+        fi
+
+        if [[ "$ENABLE_TTC" == "1" && "$sid" == *"TTC"* ]]; then
+            local remote_root_ttc remote_snapshot_ttc
+            remote_root_ttc="${spath}/Nodes/${short_ip}/${REMOTE_LABEL}"
+            remote_snapshot_ttc="${remote_root_ttc}/${TIMESTAMP}"
+
+            run_remote_sync \
+                "$sid" "$stype" "$spath" \
+                "$remote_root_ttc" "$remote_snapshot_ttc" "$TTC_KEEP" \
+                "TTC" "$snapshot_dir"
+        fi
+    done
+
+    rm -rf "$meta_dir" 2>/dev/null || true
+    log "✅ Backup completed."
+    print_summary
+}
+
+install_script() {
+    rotate_logs
+    load_env
+
+    log "🚀 ${SCRIPT_NAME} --install"
+
+    mkdir -p "$SCRIPT_DIR" "$LOG_DIR" "$LOCAL_ROOT" "$STATE_BACKUP_DIR"
+
+    local current_path target_path
+    current_path="$(readlink -f "$0")"
+    target_path="${SCRIPT_DIR}/${SCRIPT_NAME}"
+
+    if [[ "$current_path" != "$target_path" ]]; then
+        cp -f "$current_path" "$target_path"
+        chmod +x "$target_path"
+        log "✅ Script copied to $target_path"
+    else
+        chmod +x "$target_path"
+        log "ℹ️ Script already in target path: $target_path"
+    fi
+
+    if [[ ! -f "$ENV_FILE" ]]; then
+        cat > "$ENV_FILE" <<'EOF'
+# pve-backup.env
+LOCAL_KEEP="1"
+VAULT_KEEP="1"
+BACKUPS_KEEP="3"
+TTC_KEEP="1"
+
+REMOTE_LABEL="PVE-Backup"
+REMOTE_SHORT_MODE="last3octets"
+TIMER_ON_CALENDAR="*-*-* 01:00:00"
+
+ENABLE_VAULT="1"
+ENABLE_BACKUPS="1"
+ENABLE_TTC="1"
+
+NETWORK_CHECK_TIMEOUT="15"
+RSYNC_TIMEOUT="180"
+STORAGE_OP_TIMEOUT="180"
+EOF
+        log "✅ Created ENV file: $ENV_FILE"
+    else
+        log "ℹ️ ENV already exists (not overwriting): $ENV_FILE"
+    fi
+
+    cat > "$WRAPPER" <<EOF
+#!/usr/bin/env bash
+cd / 2>/dev/null || cd /root 2>/dev/null || true
+exec ${SCRIPT_DIR}/${SCRIPT_NAME} "\$@"
+EOF
+    chmod +x "$WRAPPER"
+    log "✅ Wrapper installed: $WRAPPER"
+
+    cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=TTC pve-backup - Proxmox node DR config backup
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/
+ExecStart=${SCRIPT_DIR}/${SCRIPT_NAME} --run
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+EOF
+    log "✅ Wrote service: $SERVICE_FILE"
+
+    cat > "$TIMER_FILE" <<EOF
+[Unit]
+Description=TTC pve-backup timer
+
+[Timer]
+OnCalendar=${TIMER_ON_CALENDAR}
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    log "✅ Wrote timer: $TIMER_FILE"
+
+    systemctl daemon-reload
+    systemctl enable --now pve-backup.timer
+    log "✅ Timer enabled: pve-backup.timer"
+    log "🏁 Install completed."
+}
+
+uninstall_script() {
+    rotate_logs
+    log "🧨 ${SCRIPT_NAME} --uninstall"
+
+    systemctl stop pve-backup.timer 2>/dev/null || true
+    systemctl disable pve-backup.timer 2>/dev/null || true
+
+    rm -f "$TIMER_FILE" "$SERVICE_FILE" "$WRAPPER"
+    rm -f "${SCRIPT_DIR}/${SCRIPT_NAME}"
+
+    systemctl daemon-reload
+    log "✅ Uninstall completed."
+}
+
+case "${1:-}" in
+    --run) run_backup ;;
+    --status) status_script ;;
+    --restore-plan) restore_plan ;;
+    --install) install_script ;;
+    --uninstall) uninstall_script ;;
+    *)
+        echo "Usage:"
+        echo "  pve-backup --install"
+        echo "  pve-backup --run"
+        echo "  pve-backup --status"
+        echo "  pve-backup --restore-plan"
+        echo "  pve-backup --uninstall"
+        exit 1
+        ;;
+esac
