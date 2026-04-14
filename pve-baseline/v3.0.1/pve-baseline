@@ -1,0 +1,673 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+cd / || exit 1
+
+SCRIPT_NAME="pve-baseline"
+SCRIPT_VERSION="3.0.1"
+SCRIPT_PATH="/opt/Config/Sync/Scripts/${SCRIPT_NAME}"
+
+MSCRIPT_PREFIX="${SCRIPT_NAME}-mscript"
+
+BASE_DIR="/opt/Config"
+SYNC_DIR="${BASE_DIR}/Sync"
+SCRIPTS_DIR="${SYNC_DIR}/Scripts"
+FETCH_DIR="/opt/Config/Fetch"
+LOG_DIR="${FETCH_DIR}/Logs"
+BACKUP_DIR="/root/opt/Config/Fetch/Backup"
+
+LOG_FILE="${LOG_DIR}/$(date +%Y%m%d-%H%M%S)-${SCRIPT_NAME}.log"
+CHANGELOG_FILE="${SCRIPTS_DIR}/${SCRIPT_NAME}.changelog.md"
+CHANGELOG_PENDING_FILE="${SCRIPTS_DIR}/${SCRIPT_NAME}.changelog.pending.md"
+SYNOPSIS_FILE="${SCRIPTS_DIR}/${SCRIPT_NAME}.md"
+
+SYSTEMD_SERVICE="/etc/systemd/system/${MSCRIPT_PREFIX}-swap-clean.service"
+SYSTEMD_TIMER="/etc/systemd/system/${MSCRIPT_PREFIX}-swap-clean.timer"
+
+PROFILE_TMP_FILE="/etc/profile.d/${MSCRIPT_PREFIX}-tmpdir.sh"
+SYSCTL_FILE="/etc/sysctl.d/${MSCRIPT_PREFIX}.conf"
+JOURNALD_FILE="/etc/systemd/journald.conf.d/${MSCRIPT_PREFIX}.conf"
+VZDUMP_CONF="/etc/vzdump.conf"
+
+ENABLE_VAR_CACHE_BIND="false"
+VZDUMP_EXCLUDE_VAR_CACHE="false"
+VZDUMP_TMPDIR_FALLBACK="/var/tmp"
+
+VAULT_ROOT=""
+PVE_ROOT=""
+VAULT_VAR=""
+VAULT_VAR_TMP=""
+VAULT_VAR_CACHE=""
+VAULT_TMP=""
+TMP_ALREADY_TMPFS="false"
+
+mkdir -p "${SCRIPTS_DIR}" "${LOG_DIR}" "${BACKUP_DIR}"
+exec > >(tee -a "${LOG_FILE}") 2>&1
+
+log(){ echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+section(){ echo; log "============================================================"; log "$*"; log "============================================================"; }
+ok(){ log "✅ $*"; }
+warn(){ log "⚠️  $*"; }
+err(){ log "❌ $*"; }
+
+require_root() {
+    [[ "${EUID}" -eq 0 ]] || { err "This script must be run as root."; exit 1; }
+}
+
+rotate_logs() {
+    mkdir -p "${LOG_DIR}"
+    find "${LOG_DIR}" -maxdepth 1 -type f -name "*-${SCRIPT_NAME}.log" | sort -r | tail -n +4 | xargs -r rm -f
+}
+
+backup_file() {
+    local file="$1"
+    if [[ -f "$file" ]]; then
+        local bkp="${BACKUP_DIR}/$(date +%Y%m%d-%H%M%S)-$(basename "$file").backup"
+        cp -a "$file" "$bkp"
+        ok "Backup created: $bkp"
+    fi
+}
+
+write_synopsis() {
+cat > "${SYNOPSIS_FILE}" <<EOF
+# ${SCRIPT_NAME}
+
+## Version
+${SCRIPT_VERSION}
+
+## Premise
+Before running this script, VAULT must already exist and be mounted in Proxmox as a local DIR storage.
+
+## Managed files
+- ${SCRIPT_PATH}
+- ${SYSCTL_FILE}
+- ${PROFILE_TMP_FILE}
+- ${JOURNALD_FILE}
+- ${SYSTEMD_SERVICE}
+- ${SYSTEMD_TIMER}
+
+## Key behavior
+- Detects local DIR storage named VAULT
+- Requires VAULT to be already mounted as DIR storage before installation
+- Creates VAULT/PVE layout
+- Uses /mnt/pve/VAULT/PVE/tmp as Proxmox host temporary backup directory
+- Redirects /var/tmp to VAULT
+- Keeps /tmp on tmpfs if already tmpfs
+- Exports TMPDIR/TMP/TEMP to VAULT tmp
+- Rebuilds TTC block in /etc/vzdump.conf
+- Adds stdexcludes: 1
+- Excludes guest temporary paths /tmp/* and /var/tmp/* for faster backups
+- Cleans conflicting sysctl files for tracked parameters
+- Uses TTC standard paths and log rotation
+- Uses ${MSCRIPT_PREFIX}-* naming for generated files and services
+
+## Modes
+- --install
+- --run
+- --uninstall
+- --swap-clean-only
+- --status
+EOF
+    ok "Synopsis updated: ${SYNOPSIS_FILE}"
+}
+
+ensure_changelog_exists() {
+    if [[ ! -f "${CHANGELOG_FILE}" ]]; then
+cat > "${CHANGELOG_FILE}" <<EOF
+# ${SCRIPT_NAME} changelog
+EOF
+        ok "Created changelog file: ${CHANGELOG_FILE}"
+    else
+        ok "Changelog already exists: ${CHANGELOG_FILE}"
+    fi
+}
+
+write_changelog_pending() {
+cat > "${CHANGELOG_PENDING_FILE}" <<EOF
+## v${SCRIPT_VERSION}
+- Updated vzdump managed block to make backup intent explicit
+- Added documented tmpdir section pointing to /mnt/pve/VAULT/PVE/tmp
+- Added explicit mode: snapshot to vzdump managed block
+- Added explicit bwlimit: 0 to vzdump managed block
+- Reordered notes and comments inside the managed block for clarity
+- Clarified that exclude-path values apply to guest temporary paths, while tmpdir applies to Proxmox host backup staging
+- Updated synopsis to state the prerequisite that VAULT must already exist and be mounted as local DIR storage before running the script
+EOF
+    ok "Pending changelog block updated: ${CHANGELOG_PENDING_FILE}"
+}
+
+ensure_dependency() {
+    local pkg="$1"
+    if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+        log "📦 Installing dependency: $pkg"
+        apt-get update -y
+        DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg"
+    else
+        ok "Dependency already installed: $pkg"
+    fi
+}
+
+get_storage_path_from_cfg() {
+    local storage_name="$1"
+    local in_block="false"
+    [[ -f /etc/pve/storage.cfg ]] || return 1
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^(dir|zfspool|lvmthin|lvm|nfs|cifs|pbs):[[:space:]]+([^[:space:]]+) ]]; then
+            if [[ "${BASH_REMATCH[2]}" == "${storage_name}" ]]; then
+                [[ "${BASH_REMATCH[1]}" == "dir" ]] || { err "Storage '${storage_name}' is not dir."; return 1; }
+                in_block="true"
+            else
+                in_block="false"
+            fi
+            continue
+        fi
+        if [[ "${in_block}" == "true" && "$line" =~ ^[[:space:]]*path[[:space:]]+(.+) ]]; then
+            echo "${BASH_REMATCH[1]}"
+            return 0
+        fi
+    done < /etc/pve/storage.cfg
+    return 1
+}
+
+detect_vault_path() {
+    local path=""
+    path="$(get_storage_path_from_cfg "VAULT")" || true
+    if [[ -n "${path}" && -d "${path}" && -w "${path}" ]]; then
+        echo "${path}"
+        return 0
+    fi
+    return 1
+}
+
+load_vault_layout() {
+    VAULT_ROOT="$(detect_vault_path)" || {
+        err "No writable local DIR storage path containing 'VAULT' was found."
+        return 1
+    }
+    PVE_ROOT="${VAULT_ROOT}/PVE"
+    VAULT_VAR="${PVE_ROOT}/var"
+    VAULT_VAR_TMP="${PVE_ROOT}/var/tmp"
+    VAULT_VAR_CACHE="${PVE_ROOT}/var/cache"
+    VAULT_TMP="${PVE_ROOT}/tmp"
+    ok "Detected VAULT root: ${VAULT_ROOT}"
+}
+
+detect_tmp_strategy() {
+    local fstype=""
+    fstype="$(findmnt -n -o FSTYPE /tmp 2>/dev/null || true)"
+    if [[ "${fstype}" == "tmpfs" ]]; then
+        TMP_ALREADY_TMPFS="true"
+        warn "/tmp is already tmpfs. The script will preserve tmpfs and use VAULT tmp through TMPDIR environment and vzdump tmpdir."
+    else
+        TMP_ALREADY_TMPFS="false"
+    fi
+}
+
+create_vault_dirs() {
+    section "📁 Creating VAULT directory layout"
+    mkdir -p "${VAULT_VAR}" "${VAULT_VAR_TMP}" "${VAULT_VAR_CACHE}" "${VAULT_TMP}"
+    chmod 1777 "${VAULT_VAR_TMP}" "${VAULT_TMP}"
+    ok "Created or verified: ${VAULT_VAR}"
+    ok "Created or verified: ${VAULT_VAR_TMP}"
+    ok "Created or verified: ${VAULT_VAR_CACHE}"
+    ok "Created or verified: ${VAULT_TMP}"
+}
+
+add_bind_mount_fstab() {
+    local src="$1" dst="$2"
+    if ! grep -Eq "^[^#]*[[:space:]]${dst//\//\\/}[[:space:]]+none[[:space:]]+bind|^${src//\//\\/}[[:space:]]+${dst//\//\\/}[[:space:]]+none[[:space:]]+bind" /etc/fstab 2>/dev/null; then
+        echo "${src} ${dst} none bind 0 0" >> /etc/fstab
+        ok "Added to /etc/fstab: ${src} -> ${dst}"
+    else
+        warn "fstab entry already exists: ${src} -> ${dst}"
+    fi
+}
+
+remove_bind_mount_fstab() {
+    local src="$1" dst="$2"
+    [[ -f /etc/fstab ]] || return 0
+    local tmpfile
+    tmpfile="$(mktemp)"
+    grep -Ev "^[^#]*[[:space:]]${dst//\//\\/}[[:space:]]+none[[:space:]]+bind|^${src//\//\\/}[[:space:]]+${dst//\//\\/}[[:space:]]+none[[:space:]]+bind" /etc/fstab > "$tmpfile" || true
+    cat "$tmpfile" > /etc/fstab
+    rm -f "$tmpfile"
+    ok "Removed fstab bind entry if present: ${src} -> ${dst}"
+}
+
+migrate_dir_bind() {
+    local mount_source="$1" mount_target="$2" set_sticky="${3:-false}"
+    section "🔁 Redirecting ${mount_target} -> ${mount_source}"
+    mkdir -p "${mount_source}" "${mount_target}"
+
+    if mountpoint -q "${mount_target}"; then
+        warn "${mount_target} is already a mountpoint. Skipping bind setup."
+        return 0
+    fi
+
+    rsync -aHAX "${mount_target}/" "${mount_source}/" 2>/dev/null || cp -a "${mount_target}/." "${mount_source}/" 2>/dev/null || true
+    [[ "${set_sticky}" == "true" ]] && chmod 1777 "${mount_source}"
+
+    add_bind_mount_fstab "${mount_source}" "${mount_target}"
+    mount --bind "${mount_source}" "${mount_target}"
+    mountpoint -q "${mount_target}" && ok "Bind mount active: ${mount_target} -> ${mount_source}" || { err "Bind mount failed: ${mount_target} -> ${mount_source}"; exit 1; }
+}
+
+unmount_bind_if_present() {
+    local target="$1"
+    if mountpoint -q "${target}"; then
+        umount "${target}" || warn "Could not unmount ${target}"
+        ok "Unmounted: ${target}"
+    else
+        warn "Not mounted: ${target}"
+    fi
+}
+
+set_journald_safeguards() {
+    section "🧱 Applying journald safeguards"
+    mkdir -p /etc/systemd/journald.conf.d
+    cat > "${JOURNALD_FILE}" <<EOF
+[Journal]
+SystemMaxUse=1024M
+SystemKeepFree=1024M
+RuntimeMaxUse=256M
+RuntimeKeepFree=256M
+MaxFileSec=7day
+Compress=yes
+EOF
+    systemctl restart systemd-journald
+    ok "journald safeguards applied."
+}
+
+remove_journald_safeguards() {
+    section "🧹 Removing journald safeguards"
+    rm -f "${JOURNALD_FILE}"
+    systemctl restart systemd-journald || true
+    ok "journald safeguard file removed."
+}
+
+disable_conflicting_sysctl_files() {
+    section "🧹 Disabling conflicting sysctl files"
+
+    local conflicts_dir="${BACKUP_DIR}/$(date +%Y%m%d-%H%M%S)-${SCRIPT_NAME}-sysctl-conflicts"
+    mkdir -p "${conflicts_dir}"
+
+    local pattern='vm\.swappiness|vm\.vfs_cache_pressure|vm\.dirty_background_bytes|vm\.dirty_bytes|vm\.dirty_ratio|vm\.dirty_background_ratio'
+    local f
+    local base
+    local target
+
+    for f in /etc/sysctl.d/*.conf; do
+        [[ -f "$f" ]] || continue
+        [[ "$f" == "${SYSCTL_FILE}" ]] && continue
+
+        if grep -Eq "$pattern" "$f"; then
+            cp -a "$f" "${conflicts_dir}/"
+
+            base="$(basename "$f")"
+            base="${base%.conf}"
+            target="/etc/sysctl.d/${base}.disabled-by-${MSCRIPT_PREFIX}-v${SCRIPT_VERSION}"
+
+            mv "$f" "$target"
+            ok "Disabled conflicting sysctl file: $f -> $target"
+        fi
+    done
+
+    if [[ -f /etc/sysctl.conf ]] && grep -Eq "$pattern" /etc/sysctl.conf; then
+        cp -a /etc/sysctl.conf "${conflicts_dir}/sysctl.conf.backup"
+        sed -i -E \
+            's/^[[:space:]]*(vm\.(swappiness|vfs_cache_pressure|dirty_background_bytes|dirty_bytes|dirty_ratio|dirty_background_ratio)[[:space:]]*=.*)$/# disabled-by-'"${MSCRIPT_PREFIX}"'-v'"${SCRIPT_VERSION}"': \1/g' \
+            /etc/sysctl.conf
+        ok "Commented conflicting lines in /etc/sysctl.conf"
+    fi
+
+    if grep -REq "$pattern" /usr/lib/sysctl.d /lib/sysctl.d 2>/dev/null; then
+        warn "Conflict-like parameters were found under /usr/lib or /lib sysctl directories. These were NOT modified."
+    fi
+}
+
+restore_disabled_sysctl_files() {
+    section "🧹 Restoring sysctl file naming"
+
+    local f
+    local restored
+
+    find /etc/sysctl.d -maxdepth 1 -type f -name "*.disabled-by-${MSCRIPT_PREFIX}-v*" | while read -r f; do
+        restored="${f%.disabled-by-${MSCRIPT_PREFIX}-v*}.conf"
+        mv "$f" "$restored" 2>/dev/null || true
+    done
+
+    ok "Disabled sysctl files restored where possible."
+}
+
+set_sysctl_tuning() {
+    section "🧠 Applying sysctl tuning"
+    disable_conflicting_sysctl_files
+
+    cat > "${SYSCTL_FILE}" <<EOF
+# ${MSCRIPT_PREFIX} v${SCRIPT_VERSION}
+vm.swappiness=10
+vm.vfs_cache_pressure=50
+vm.dirty_background_ratio=0
+vm.dirty_ratio=0
+vm.dirty_background_bytes=67108864
+vm.dirty_bytes=268435456
+EOF
+
+    sysctl --system >/dev/null 2>&1 || true
+    sysctl -w vm.swappiness=10 >/dev/null 2>&1 || true
+    sysctl -w vm.vfs_cache_pressure=50 >/dev/null 2>&1 || true
+    sysctl -w vm.dirty_background_ratio=0 >/dev/null 2>&1 || true
+    sysctl -w vm.dirty_ratio=0 >/dev/null 2>&1 || true
+    sysctl -w vm.dirty_background_bytes=67108864 >/dev/null 2>&1 || true
+    sysctl -w vm.dirty_bytes=268435456 >/dev/null 2>&1 || true
+
+    ok "Applied sysctl tuning."
+}
+
+verify_sysctl_tuning() {
+    section "🔎 Verifying effective sysctl values"
+    local a b c d e f
+    a="$(sysctl -n vm.swappiness 2>/dev/null || echo unknown)"
+    b="$(sysctl -n vm.vfs_cache_pressure 2>/dev/null || echo unknown)"
+    c="$(sysctl -n vm.dirty_background_ratio 2>/dev/null || echo unknown)"
+    d="$(sysctl -n vm.dirty_ratio 2>/dev/null || echo unknown)"
+    e="$(sysctl -n vm.dirty_background_bytes 2>/dev/null || echo unknown)"
+    f="$(sysctl -n vm.dirty_bytes 2>/dev/null || echo unknown)"
+
+    log "Effective vm.swappiness=${a} (expected 10)"
+    log "Effective vm.vfs_cache_pressure=${b} (expected 50)"
+    log "Effective vm.dirty_background_ratio=${c} (expected 0)"
+    log "Effective vm.dirty_ratio=${d} (expected 0)"
+    log "Effective vm.dirty_background_bytes=${e} (expected 67108864)"
+    log "Effective vm.dirty_bytes=${f} (expected 268435456)"
+}
+
+remove_sysctl_tuning() {
+    section "🧹 Removing sysctl tuning"
+    rm -f "${SYSCTL_FILE}"
+    restore_disabled_sysctl_files
+    sysctl --system >/dev/null 2>&1 || true
+    ok "sysctl tuning removed."
+}
+
+configure_system_tmp_env() {
+    section "🌡️ Configuring TMPDIR environment"
+    cat > "${PROFILE_TMP_FILE}" <<EOF
+export TMPDIR="${VAULT_TMP}"
+export TMP="${VAULT_TMP}"
+export TEMP="${VAULT_TMP}"
+EOF
+    chmod 0644 "${PROFILE_TMP_FILE}"
+    ok "Configured ${PROFILE_TMP_FILE}"
+}
+
+remove_system_tmp_env() {
+    section "🧹 Removing TMPDIR environment"
+    rm -f "${PROFILE_TMP_FILE}"
+    ok "TMPDIR environment file removed."
+}
+
+build_vzdump_managed_block() {
+cat <<EOF
+# ${MSCRIPT_PREFIX} managed block - begin
+
+# Temp directory for snapshots
+tmpdir: ${VAULT_TMP}
+
+# Backup mode: snapshot recommended for active VMs
+mode: snapshot
+# For very large VMs or if snapshot causes freezes, use:
+# mode: stop
+
+# Compression settings
+compress: zstd
+zstd: 1
+
+# Exclude temporary paths inside guests
+stdexcludes: 1
+exclude-path: /tmp/*
+exclude-path: /var/tmp/*
+# Activate only if you are fully sure guests do not use this path in special LXCs
+#exclude-path: /var/cache/*
+
+# I/O priority
+ionice: 7
+
+# Parallelism: only 1 worker to avoid NFS saturation. Controls how many parallel workers vzdump uses internally.
+performance: max-workers=1
+
+# Explicit notes template
+notes-template: {{guestname}}, {{node}}, {{vmid}}
+
+# Bandwidth limit: 0 = unlimited (let Proxmox saturate network bandwidth safely)
+bwlimit: 0
+
+# ${MSCRIPT_PREFIX} managed block - end
+EOF
+}
+
+configure_vzdump() {
+    section "💾 Configuring /etc/vzdump.conf"
+    touch "${VZDUMP_CONF}"
+    backup_file "${VZDUMP_CONF}"
+    sed -i '/# '"${MSCRIPT_PREFIX}"' managed block - begin/,/# '"${MSCRIPT_PREFIX}"' managed block - end/d' "${VZDUMP_CONF}"
+    { echo; build_vzdump_managed_block; } >> "${VZDUMP_CONF}"
+    ok "vzdump.conf updated."
+}
+
+remove_vzdump_managed_block() {
+    section "🧹 Removing TTC-managed block from vzdump.conf"
+    if [[ -f "${VZDUMP_CONF}" ]]; then
+        backup_file "${VZDUMP_CONF}"
+        sed -i '/# '"${MSCRIPT_PREFIX}"' managed block - begin/,/# '"${MSCRIPT_PREFIX}"' managed block - end/d' "${VZDUMP_CONF}"
+        ok "Removed TTC-managed block from ${VZDUMP_CONF}"
+    fi
+}
+
+safe_swap_clean() {
+    section "🧼 Safe swap cleanup"
+    local mem_available_mib swap_used_mib
+    mem_available_mib="$(awk '/MemAvailable:/ {print int($2/1024)}' /proc/meminfo)"
+    swap_used_mib="$(free -m | awk '/Swap:/ {print $3}')"
+    log "MemAvailable: ${mem_available_mib} MiB"
+    log "SwapUsed:     ${swap_used_mib} MiB"
+    (( swap_used_mib < 1024 )) && { warn "Swap usage is low. Skipping cleanup."; return 0; }
+    (( mem_available_mib < 4096 )) && { warn "Not enough free RAM to safely drain swap."; return 0; }
+    swapoff -a || { warn "swapoff failed."; return 0; }
+    swapon -a || { warn "swapon failed."; return 0; }
+    ok "Swap cleanup completed."
+}
+
+install_systemd_timer() {
+    section "⏱️ Installing TTC swap clean timer"
+    systemctl disable --now "$(basename "${SYSTEMD_TIMER}")" 2>/dev/null || true
+    rm -f "${SYSTEMD_SERVICE}" "${SYSTEMD_TIMER}"
+    systemctl daemon-reload
+
+    cat > "${SYSTEMD_SERVICE}" <<EOF
+[Unit]
+Description=TTC safe swap cleanup for ${MSCRIPT_PREFIX}
+
+[Service]
+Type=oneshot
+ExecStart=${SCRIPT_PATH} --swap-clean-only
+EOF
+
+    cat > "${SYSTEMD_TIMER}" <<EOF
+[Unit]
+Description=Run TTC safe swap cleanup daily for ${MSCRIPT_PREFIX}
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now "$(basename "${SYSTEMD_TIMER}")"
+    ok "Timer enabled: $(basename "${SYSTEMD_TIMER}")"
+}
+
+remove_systemd_timer() {
+    section "🧹 Removing TTC swap clean timer"
+    systemctl disable --now "$(basename "${SYSTEMD_TIMER}")" 2>/dev/null || true
+    rm -f "${SYSTEMD_SERVICE}" "${SYSTEMD_TIMER}"
+    systemctl daemon-reload
+    ok "Timer and service removed."
+}
+
+show_status() {
+    section "📊 Current status"
+    load_vault_layout || true
+    detect_tmp_strategy || true
+    echo "Script version: ${SCRIPT_VERSION}"
+    echo "VAULT root: ${VAULT_ROOT:-not-detected}"
+    echo "ENABLE_VAR_CACHE_BIND: ${ENABLE_VAR_CACHE_BIND}"
+    echo "VZDUMP_EXCLUDE_VAR_CACHE: ${VZDUMP_EXCLUDE_VAR_CACHE}"
+    echo "TMP_ALREADY_TMPFS: ${TMP_ALREADY_TMPFS}"
+    echo
+    echo "findmnt /tmp:"; findmnt /tmp || true
+    echo
+    echo "findmnt /var/tmp:"; findmnt /var/tmp || true
+    echo
+    echo "findmnt /var/cache:"; findmnt /var/cache || true
+    echo
+    echo "Managed block in /etc/vzdump.conf:"; grep -A30 -B2 "${MSCRIPT_PREFIX} managed block - begin" "${VZDUMP_CONF}" 2>/dev/null || true
+    echo
+    echo "Sysctl:"; sysctl vm.swappiness vm.vfs_cache_pressure vm.dirty_ratio vm.dirty_background_ratio vm.dirty_background_bytes vm.dirty_bytes 2>/dev/null || true
+    echo
+    echo "Timer:"; systemctl status "$(basename "${SYSTEMD_TIMER}")" --no-pager || true
+}
+
+install_self_wrapper() {
+    section "🔧 Installing global wrapper"
+    if [[ "${0}" != "${SCRIPT_PATH}" ]]; then
+        cp -f "${0}" "${SCRIPT_PATH}"
+        chmod +x "${SCRIPT_PATH}"
+        ok "Copied script to ${SCRIPT_PATH}"
+    else
+        ok "Script already running from standard TTC path."
+    fi
+    ln -sf "${SCRIPT_PATH}" "/usr/local/bin/${SCRIPT_NAME}"
+    ok "Global wrapper created: /usr/local/bin/${SCRIPT_NAME}"
+}
+
+remove_self_wrapper() {
+    section "🧹 Removing global wrapper and TTC script files"
+    rm -f "/usr/local/bin/${SCRIPT_NAME}"
+    rm -f "${SCRIPTS_DIR}/${SCRIPT_NAME}"
+    rm -f "${SYNOPSIS_FILE}" "${CHANGELOG_PENDING_FILE}"
+    ok "Removed TTC wrapper and companion files. Main changelog preserved: ${CHANGELOG_FILE}"
+}
+
+run_baseline() {
+    require_root
+    rotate_logs
+    load_vault_layout || exit 1
+    detect_tmp_strategy
+
+    section "🚀 START ${SCRIPT_NAME} v${SCRIPT_VERSION}"
+    log "Host: $(hostname)"
+    log "Kernel: $(uname -r)"
+    log "Date: $(date)"
+    log "VAULT root: ${VAULT_ROOT}"
+    log "ENABLE_VAR_CACHE_BIND=${ENABLE_VAR_CACHE_BIND}"
+    log "VZDUMP_EXCLUDE_VAR_CACHE=${VZDUMP_EXCLUDE_VAR_CACHE}"
+    log "TMP_ALREADY_TMPFS=${TMP_ALREADY_TMPFS}"
+
+    ensure_dependency rsync
+    create_vault_dirs
+    set_journald_safeguards
+    set_sysctl_tuning
+    verify_sysctl_tuning
+
+    migrate_dir_bind "${VAULT_VAR_TMP}" "/var/tmp" "true"
+
+    if [[ "${ENABLE_VAR_CACHE_BIND}" == "true" ]]; then
+        migrate_dir_bind "${VAULT_VAR_CACHE}" "/var/cache" "false"
+    else
+        warn "/var/cache bind mount is disabled by configuration."
+    fi
+
+    if [[ "${TMP_ALREADY_TMPFS}" == "true" ]]; then
+        warn "/tmp remains tmpfs by design on this host."
+    else
+        migrate_dir_bind "${VAULT_TMP}" "/tmp" "true"
+    fi
+
+    configure_system_tmp_env
+    configure_vzdump
+    install_systemd_timer
+    safe_swap_clean
+    write_synopsis
+    ensure_changelog_exists
+    write_changelog_pending
+    show_status
+
+    section "🏁 END"
+    ok "Baseline applied successfully."
+}
+
+install_mode() {
+    require_root
+    rotate_logs
+    install_self_wrapper
+    run_baseline
+}
+
+uninstall_mode() {
+    require_root
+    rotate_logs
+    section "🗑️ UNINSTALL ${SCRIPT_NAME} v${SCRIPT_VERSION}"
+
+    load_vault_layout || warn "VAULT layout not detected during uninstall; continuing."
+
+    remove_systemd_timer
+    remove_vzdump_managed_block
+    remove_system_tmp_env
+    remove_journald_safeguards
+    remove_sysctl_tuning
+
+    [[ -n "${VAULT_VAR_TMP}" ]] && { unmount_bind_if_present "/var/tmp"; remove_bind_mount_fstab "${VAULT_VAR_TMP}" "/var/tmp"; }
+    [[ -n "${VAULT_VAR_CACHE}" ]] && { unmount_bind_if_present "/var/cache"; remove_bind_mount_fstab "${VAULT_VAR_CACHE}" "/var/cache"; }
+
+    if [[ -n "${VAULT_TMP}" ]]; then
+        if [[ "$(findmnt -n -o FSTYPE /tmp 2>/dev/null || true)" != "tmpfs" ]]; then
+            unmount_bind_if_present "/tmp"
+        else
+            warn "/tmp is tmpfs; no bind unmount required."
+        fi
+        remove_bind_mount_fstab "${VAULT_TMP}" "/tmp"
+    fi
+
+    remove_self_wrapper
+    section "✅ UNINSTALL COMPLETE"
+    ok "Uninstall completed."
+}
+
+usage() {
+cat <<EOF
+Usage:
+  ${SCRIPT_NAME} --install
+  ${SCRIPT_NAME} --run
+  ${SCRIPT_NAME} --uninstall
+  ${SCRIPT_NAME} --swap-clean-only
+  ${SCRIPT_NAME} --status
+EOF
+}
+
+main() {
+    case "${1:-}" in
+        --install) install_mode ;;
+        --run) run_baseline ;;
+        --uninstall) uninstall_mode ;;
+        --swap-clean-only) require_root; rotate_logs; safe_swap_clean ;;
+        --status) require_root; rotate_logs; show_status ;;
+        *) usage; exit 1 ;;
+    esac
+}
+
+main "$@"

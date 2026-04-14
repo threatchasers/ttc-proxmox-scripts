@@ -1,0 +1,45 @@
+#!/bin/bash
+set -euo pipefail
+. /opt/Config/Sync/Scripts/pve-lib-log.sh
+log_new "pve-standalone"
+log_line "PVE standalone hardening on $(hostname)"
+
+# 1) Ver servicios PVE y /etc/pve
+log_line "== services =="
+systemctl is-active pveproxy pvedaemon pvestatd 2>&1 | tee -a "$LOG_FILE" || true
+log_line "== /etc/pve mount =="
+mountpoint /etc/pve 2>&1 | tee -a "$LOG_FILE" || true
+
+# 2) Deshabilitar stack de cluster si existe (sin borrar config)
+log_line "== disable cluster stack =="
+systemctl stop corosync pve-ha-crm pve-ha-lrm 2>>"$LOG_FILE" || true
+systemctl disable corosync pve-ha-crm pve-ha-lrm 2>>"$LOG_FILE" || true
+systemctl mask corosync 2>>"$LOG_FILE" || true
+
+# 3) Limpiar corosync *solo si existe*, no tocar /etc/pve/*
+if [ -f /etc/corosync/corosync.conf ] || [ -d /etc/corosync ]; then
+  log_line "Purging /etc/corosync (safe, no /etc/pve touch)"
+  rm -rf /etc/corosync/* 2>>"$LOG_FILE" || true
+fi
+
+# 4) Ajustes de datacenter.cfg mínimos (no-quorum-policy=ignore en single)
+log_line "== datacenter.cfg =="
+DC="/etc/pve/datacenter.cfg"
+if ! grep -q '^no-quorum-policy:' "$DC" 2>/dev/null; then
+  echo "no-quorum-policy: ignore" >> "$DC"
+fi
+# Quitar claves inválidas si quedaron de intentos previos
+sed -i '/^console:/d;/^fencing:/d' "$DC" || true
+
+# 5) Reiniciar demonios base
+log_line "== restart pve daemons =="
+systemctl restart pveproxy pvedaemon pvestatd 2>>"$LOG_FILE" || true
+systemctl status pveproxy --no-pager 2>>"$LOG_FILE" || true
+
+# 6) Reporte sockets/UI
+log_line "== sockets/UI =="
+ss -lntp | egrep '(:22|:8006)\b' 2>>"$LOG_FILE" || true
+curl -k --max-time 3 https://127.0.0.1:8006 1>/dev/null 2>>"$LOG_FILE" || true
+
+log_rotate_keep3 "pve-standalone"
+log_line "DONE"

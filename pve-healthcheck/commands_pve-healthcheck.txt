@@ -1,0 +1,32 @@
+
+
+v1.1
+
+#Uninstall
+pve-healthcheck --uninstall
+/opt/Config/Sync/Scripts/pve-healthcheck.sh --uninstall
+
+# Remove files
+rm -f /opt/Config/Sync/Scripts/pve-healthcheck*
+
+#Crear diretory /file y copia script
+mkdir -p /opt/Config/Sync/Scripts
+nano /opt/Config/Sync/Scripts/pve-healthcheck.sh
+
+#Aplica Permisos
+chmod +x /opt/Config/Sync/Scripts/pve-healthcheck.sh
+
+#Instalar
+/opt/Config/Sync/Scripts/pve-healthcheck.sh --install
+
+#Run script
+pve-healthcheck --run
+
+#Verificar logs
+ls -lah /opt/Config/Fetch/Logs/*-pve-healthcheck.log
+
+#Probar servicio
+systemctl status pve-healthcheck-mscript.service
+
+
+pve-healthcheck --uninstall

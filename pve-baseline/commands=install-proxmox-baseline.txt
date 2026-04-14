@@ -1,0 +1,124 @@
+
+v3.2.0 =============================
+sudo /opt/Config/Sync/Scripts/pve-baseline --uninstall
+sudo rm -f /opt/Config/Sync/Scripts/pve-baseline
+sudo rm -f /usr/local/bin/pve-baseline
+
+sudo mkdir -p /opt/Config/Sync/Scripts
+sudo mkdir -p /opt/Config/Fetch/Logs
+sudo mkdir -p /root/opt/Config/Fetch/Backup
+
+sudo nano /opt/Config/Sync/Scripts/pve-baseline
+sudo chmod +x /opt/Config/Sync/Scripts/pve-baseline
+
+
+#Instalacion
+sudo /opt/Config/Sync/Scripts/pve-baseline --install
+
+systemctl status pve-baseline-mscript-swap-clean.timer --no-pager
+systemctl status pve-baseline-mscript-swap-clean.service --no-pager
+
+#Verificación
+sudo pve-baseline --status
+systemctl status pve-baseline-mscript-swap-clean.timer --no-pager
+systemctl status pve-baseline-mscript-health-check.timer --no-pager
+systemctl list-timers --all | grep pve-baseline
+findmnt /mnt/pve/VAULT
+findmnt /var/tmp
+
+
+===============================================================
+v3.0.0
+sudo /opt/Config/Sync/Scripts/pve-baseline --uninstall
+sudo rm -f /opt/Config/Sync/Scripts/pve-baseline
+sudo rm -f /usr/local/bin/pve-baseline
+
+sudo mkdir -p /opt/Config/Sync/Scripts
+sudo mkdir -p /opt/Config/Fetch/Logs
+sudo mkdir -p /root/opt/Config/Fetch/Backup
+
+sudo nano /opt/Config/Sync/Scripts/pve-baseline
+sudo chmod +x /opt/Config/Sync/Scripts/pve-baseline
+
+
+#Instalacion
+sudo /opt/Config/Sync/Scripts/pve-baseline --install
+
+systemctl status pve-baseline-mscript-swap-clean.timer --no-pager
+systemctl status pve-baseline-mscript-swap-clean.service --no-pager
+
+
+7) Verificación
+7.1 Ver timer y service
+systemctl status pve-baseline-mscript-swap-clean.timer --no-pager
+systemctl status pve-baseline-mscript-swap-clean.service --no-pager
+7.2 Ver bloque de vzdump
+grep -n "pve-baseline-mscript managed block" -A30 -B2 /etc/vzdump.conf
+7.3 Ver mounts
+findmnt /var/tmp
+findmnt /tmp
+7.4 Ver sysctl efectivo
+sysctl vm.swappiness vm.vfs_cache_pressure vm.dirty_ratio vm.dirty_background_ratio vm.dirty_background_bytes vm.dirty_bytes
+7.5 Ver timers registrados
+systemctl list-timers --all | grep pve-baseline
+
+
+ =====================================================
+sudo /opt/Config/Sync/Scripts/install-proxmox-baseline --uninstall 2>/dev/null || true
+rm -f  /opt/Config/Sync/Scripts/install-proxmox-baseline*
+sudo mkdir -p /opt/Config/Sync/Scripts
+
+#Copy Script
+sudo nano /opt/Config/Sync/Scripts/install-proxmox-baseline
+
+#copy Changelog
+sudo nano /opt/Config/Sync/Scripts/install-proxmox-baseline.changelog.md
+
+#Permisocat /s 
+cd /
+sudo chmod +x /opt/Config/Sync/Scripts/install-proxmox-baseline
+
+#Install script and run
+sudo /opt/Config/Sync/Scripts/install-proxmox-baseline --install
+sudo install-proxmox-baseline --run
+
+#validar
+sudo systemctl status ttc-swap-clean.timer --no-pager
+cd /
+sudo install-proxmox-baseline --status
+
+echo
+grep -R "vm.swappiness\|vm.vfs_cache_pressure\|vm.dirty_background_bytes\|vm.dirty_bytes\|vm.dirty_ratio\|vm.dirty_background_ratio" \
+/etc/sysctl.conf /etc/sysctl.d /usr/lib/sysctl.d /lib/sysctl.d 2>/dev/null
+echo
+sysctl vm.swappiness vm.vfs_cache_pressure vm.dirty_ratio vm.dirty_background_ratio vm.dirty_background_bytes vm.dirty_bytes
+   
+echo
+grep -A20 -B2 "TTC baseline managed block - begin" /etc/vzdump.conf
+echo
+sysctl vm.swappiness vm.vfs_cache_pressure vm.dirty_background_bytes vm.dirty_bytes
+echo
+findmnt /tmp
+echo
+findmnt /var/tmp
+echo
+findmnt /var/cache || true
+
+#Revisar Logs
+ls -lt /opt/Config/Fetch/Logs/*-install-proxmox-baseline.log | head
+sudo tail -n 220 "$(ls -1t /opt/Config/Fetch/Logs/*-install-proxmox-baseline.log | head -n 1)"
+
+
+
+
+# chequear  sysctl conf files
+ cd /
+grep -R "vm.swappiness\|vm.vfs_cache_pressure\|vm.dirty_background_bytes\|vm.dirty_bytes\|vm.dirty_ratio\|vm.dirty_background_ratio" \
+/etc/sysctl.conf /etc/sysctl.d /usr/lib/sysctl.d /lib/sysctl.d 2>/dev/null
+
+
+#Remove conf files from 
+cd /etc/sysctl.d
+sudo rm -f zzz*
+O
+sudo rm -f /etc/sysctl.d/zzz*

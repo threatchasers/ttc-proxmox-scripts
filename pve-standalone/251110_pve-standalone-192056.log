@@ -1,0 +1,39 @@
+== 2025-11-10T19:20:56-05:00 start pve-standalone ==
+PVE standalone posture on popular
+== services (pre) ==
+active
+active
+active
+== /etc/pve mount ==
+/etc/pve is a mountpoint
+== disable/mask cluster/HA ==
+Unit /etc/systemd/system/corosync.service is masked, ignoring.
+== ensure pmxcfs local mode ==
+== datacenter.cfg (no-quorum-policy: ignore) ==
+== restart API daemons ==
+● pveproxy.service - PVE API Proxy Server
+     Loaded: loaded (/usr/lib/systemd/system/pveproxy.service; enabled; preset: enabled)
+     Active: active (running) since Mon 2025-11-10 19:21:09 EST; 12ms ago
+ Invocation: 2a4e7c0463eb46169f09d3bbb901d844
+    Process: 67635 ExecStartPre=/usr/bin/pvecm updatecerts --silent (code=exited, status=0/SUCCESS)
+    Process: 67638 ExecStart=/usr/bin/pveproxy start (code=exited, status=0/SUCCESS)
+    Process: 67660 ExecStartPost=sh -c [ ! -e /var/log/pveam.log ] && /usr/bin/pveupdate (code=exited, status=1/FAILURE)
+   Main PID: 67656 (pveproxy)
+      Tasks: 4 (limit: 309257)
+     Memory: 158.7M (peak: 177M)
+        CPU: 2.725s
+     CGroup: /system.slice/pveproxy.service
+             ├─67656 pveproxy
+             ├─67657 "pveproxy worker"
+             ├─67658 "pveproxy worker"
+             └─67659 "pveproxy worker"
+
+Nov 10 19:21:06 popular systemd[1]: Starting pveproxy.service - PVE API Proxy Server...
+Nov 10 19:21:09 popular pveproxy[67656]: starting server
+Nov 10 19:21:09 popular pveproxy[67656]: starting 3 worker(s)
+Nov 10 19:21:09 popular pveproxy[67656]: worker 67657 started
+Nov 10 19:21:09 popular pveproxy[67656]: worker 67658 started
+Nov 10 19:21:09 popular pveproxy[67656]: worker 67659 started
+Nov 10 19:21:09 popular systemd[1]: Started pveproxy.service - PVE API Proxy Server.
+== sockets/UI ==
+== pvesm status ==

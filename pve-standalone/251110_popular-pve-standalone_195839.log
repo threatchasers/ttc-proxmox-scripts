@@ -1,0 +1,15 @@
+== 2025-11-10T19:58:39-05:00 start pve-standalone on popular ==
+Posture check (standalone mode) on popular
+== services (pre) ==
+active
+active
+active
+== /etc/pve mount ==
+/etc/pve is a mountpoint
+== disable/mask cluster/HA ==
+Unit /etc/systemd/system/corosync.service is masked, ignoring.
+== pmxcfs local mode ==
+== datacenter.cfg (no-quorum-policy: ignore) ==
+== skipping daemon restarts (safe mode) ==
+== sockets/UI ==
+== pvesm status ==

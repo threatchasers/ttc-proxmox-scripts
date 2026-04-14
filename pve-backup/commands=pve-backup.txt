@@ -1,0 +1,23 @@
+sudo pve-backup --uninstall
+rm -f  /opt/Config/Sync/Scripts/pve-backup*
+sudo mkdir -p /opt/Config/Sync/Scripts
+
+#Copy Script
+sudo nano /opt/Config/Sync/Scripts/pve-backup
+sudo chmod +x /opt/Config/Sync/Scripts/pve-backup
+
+#copy Changelog
+sudo nano /opt/Config/Sync/Scripts/pve-backup.changelog.md
+
+#Install script
+sudo /opt/Config/Sync/Scripts/pve-backup --install
+sudo systemctl daemon-reload
+
+#Run script-validar
+sudo pve-backup --status
+sudo pve-backup --run
+
+#Revisar Logs
+ls -lt /opt/Config/Fetch/Logs/*-pve-backup.log | head
+sudo tail -n 220 "$(ls -1t /opt/Config/Fetch/Logs/*-pve-backup.log | head -n 1)"
+
